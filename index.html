@@ -422,8 +422,12 @@
       }
 
       // attach to three renderer
-      await renderer.xr.setSession(xrSession);
-      lastT = performance.now();
+      \1
+      // Ensure reference space preference is consistent across runtimes
+      if (renderer.xr.setReferenceSpaceType) {
+        try { renderer.xr.setReferenceSpaceType('local-floor'); } catch(_) {}
+      }
+lastT = performance.now();
 
       // small visible test object for debugging in XR: ensures something is always visible
       const testGeo = new THREE.BoxGeometry(0.08,0.08,0.08);
