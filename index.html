@@ -148,6 +148,12 @@
   const renderer = new THREE.WebGLRenderer({ canvas: $('webgl'), antialias:true, alpha:false });
   renderer.xr.enabled = true;
   renderer.outputEncoding = THREE.sRGBEncoding;
+  // prefer a standing/local-floor reference space in XR sessions
+  renderer.xr.setReferenceSpaceType && renderer.xr.setReferenceSpaceType('local-floor');
+
+  // ensure touch / pointer behavior doesn't conflict with WebXR
+  renderer.domElement.style.touchAction = 'none';
+
   function fit(){ const dpr=Math.min(2,window.devicePixelRatio||1); renderer.setPixelRatio(dpr); renderer.setSize(window.innerWidth, window.innerHeight, false); }
   window.addEventListener('resize', fit);
   fit();
@@ -395,34 +401,112 @@
   $('btnStart').addEventListener('click', ()=>{ if(!running){ running=true; lastT=performance.now(); requestAnimationFrame(renderLoop); }});
   $('btnStop').addEventListener('click', ()=>{ running=false; });
 
-  // VR enter/exit (kept simple)
+  // VR enter/exit (improved for broader device support)
   let xrSession = null;
   $('enterVR').addEventListener('click', async ()=>{
     try{
-      if(!navigator.xr){ alert('WebXR 미지원'); return; }
-      const ok = await navigator.xr.isSessionSupported('immersive-vr');
-      if(!ok){ alert('immersive-vr 세션 미지원'); return; }
-      xrSession = await navigator.xr.requestSession('immersive-vr');
+      if(!navigator.xr){ alert('WebXR 미지원(브라우저/플랫폼에서 WebXR API를 찾을 수 없습니다). HTTPS로 호스트하거나 WebXR 지원 브라우저에서 실행하세요.'); return; }
+
+      // Prefer immersive-vr but try to detect support robustly
+      const supportsVR = await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false);
+      if(!supportsVR){
+        // fallback hint: try immersive-ar or show a friendly message
+        const supportsAR = await navigator.xr.isSessionSupported('immersive-ar').catch(()=>false);
+        if(supportsAR){
+          if(!confirm('디바이스는 immersive-vr 를 지원하지 않지만 immersive-ar 를 지원합니다. AR 모드로 전환하시겠습니까?')) return;
+        } else {
+          alert('이 기기/브라우저는 immersive VR 세션을 지원하지 않습니다. WebXR을 지원하는 최신 브라우저(Chrome/Edge 등)와 VR 헤드셋을 사용하거나 WebXR 폴리필을 확인하세요.');
+          return;
+        }
+      }
+
+      // Request session with several optional features to increase the chance of success
+      const sessionInit = {
+        optionalFeatures: ['local-floor','bounded-floor','hand-tracking','layers','viewer','dom-overlay'],
+        // domOverlay requires a root if used; include it only as optional and provide root if available
+        domOverlay: { root: document.body }
+      };
+
+      // request immersive-vr but allow exceptions to be caught
+      xrSession = await navigator.xr.requestSession('immersive-vr', sessionInit).catch(async (err)=>{
+        // If immersive-vr failed, try immersive-ar as a fallback (if supported)
+        console.warn('immersive-vr request failed:', err);
+        const arSupported = await navigator.xr.isSessionSupported('immersive-ar').catch(()=>false);
+        if(arSupported){
+          return await navigator.xr.requestSession('immersive-ar', sessionInit);
+        }
+        throw err;
+      });
+
+      // Ensure reference space type preference is set (three.js will use this)
+      renderer.xr.setReferenceSpaceType && renderer.xr.setReferenceSpaceType('local-floor');
+
+      // Attach session to three.js renderer
       await renderer.xr.setSession(xrSession);
-      const xrCam = renderer.xr.getCamera(camera);
-      if(xrCam && xrCam.isArrayCamera && xrCam.cameras && xrCam.cameras.length>=2){
+
+      // set lastT to avoid huge dt on session start
+      lastT = performance.now();
+
+      // Configure the XR cameras' layers so each eye sees its layer (if array camera is available)
+      const xrCam = renderer.xr.getCamera ? renderer.xr.getCamera(camera) : null;
+      if(xrCam && xrCam.isArrayCamera && xrCam.cameras && xrCam.cameras.length >= 2){
+        // ensure consistent mapping: left eye camera -> LAYER_L, right -> LAYER_R
+        // Do this now and also in the animation loop because some devices recreate cameras
         xrCam.cameras[0].layers.enable(LAYER_L); xrCam.cameras[0].layers.disable(LAYER_R);
         xrCam.cameras[1].layers.enable(LAYER_R); xrCam.cameras[1].layers.disable(LAYER_L);
       }
+
+      // Use three.js animation loop for XR. It will call this callback with a high-res timestamp.
       renderer.setAnimationLoop((now)=>{
-        const dt = (now - lastT)/1000; lastT = now;
+        // keep lastT updated for pop timing (use performance.now()-based dt)
+        const dt = (now - lastT) / 1000;
+        lastT = now;
+
+        // per-frame: update pop and billboards
         if(running) updatePop(dt);
-        // billboard in XR too
+
+        // billboard in XR too: get an XR-aware camera (three.js supplies it to renderer.render)
         if($('source').value === 'image_pair'){
-          if(meshL && meshL.userData.isImagePlane) meshL.quaternion.copy(renderer.xr.getCamera(camera).quaternion || camera.quaternion);
-          if(meshR && meshR.userData.isImagePlane) meshR.quaternion.copy(renderer.xr.getCamera(camera).quaternion || camera.quaternion);
+          const xrCamera = renderer.xr.getCamera ? renderer.xr.getCamera(camera) : camera;
+          if(meshL && meshL.userData.isImagePlane) meshL.quaternion.copy(xrCamera.quaternion || camera.quaternion);
+          if(meshR && meshR.userData.isImagePlane) meshR.quaternion.copy(xrCamera.quaternion || camera.quaternion);
+        } else {
+          if($('autoRotate').checked) fusionGroup.rotation.y += dt * (+$('primSize') || 0.4);
         }
+
+        // Ensure per-eye layers remain set each frame in case the XR camera structure was updated by the runtime
+        const xrCameraNow = renderer.xr.getCamera ? renderer.xr.getCamera(camera) : null;
+        if(xrCameraNow && xrCameraNow.isArrayCamera && xrCameraNow.cameras){
+          if(xrCameraNow.cameras.length >= 2){
+            xrCameraNow.cameras[0].layers.enable(LAYER_L); xrCameraNow.cameras[0].layers.disable(LAYER_R);
+            xrCameraNow.cameras[1].layers.enable(LAYER_R); xrCameraNow.cameras[1].layers.disable(LAYER_L);
+          }
+        }
+
+        // Render; three.js will handle XR framebuffer and view/projection for each eye
         renderer.render(scene, camera);
       });
-      xrSession.addEventListener('end', ()=>{ renderer.setAnimationLoop(null); xrSession=null; });
-    }catch(e){ console.error(e); alert('VR 진입 오류: '+(e && e.message || e)); }
+
+      // clean up on session end
+      xrSession.addEventListener('end', ()=>{
+        renderer.setAnimationLoop(null);
+        xrSession = null;
+        // reset lastT to avoid big dt on resume
+        lastT = performance.now();
+      });
+    }catch(e){
+      console.error('VR 진입 오류:', e);
+      alert('VR 진입 오류: ' + (e && e.message ? e.message : e));
+    }
   });
-  $('exitVR').addEventListener('click', async ()=>{ try{ if(xrSession) await xrSession.end(); }catch{} });
+
+  $('exitVR').addEventListener('click', async ()=>{
+    try{
+      if(xrSession) await xrSession.end();
+    }catch(e){
+      console.warn('XR 세션 종료 실패', e);
+    }
+  });
 
   // initialize with primitive
   buildFusionFromPrimitive('sphere', +$('primSize').value);
