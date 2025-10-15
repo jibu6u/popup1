@@ -510,6 +510,14 @@
 
   // initialize with primitive
   buildFusionFromPrimitive('sphere', +$('primSize').value);
+
+  // --- 핵심 추가: 초기 렌더가 빈 화면(검은 화면)이 되는 것을 막기 위해
+  // 카메라에서 좌/우 레이어를 기본으로 활성화하고 한 프레임 렌더링합니다.
+  camera.layers.enable(LAYER_L);
+  camera.layers.enable(LAYER_R);
+  renderer.render(scene, camera);
+  // --- 끝
+
 })();
 </script>
 </body>
